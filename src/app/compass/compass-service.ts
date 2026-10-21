@@ -1,175 +1,81 @@
+import { Injectable, signal, computed } from '@angular/core';
 
+export const CAIRO_TOWER = { lat: 30.0459, lng: 31.2243 };
 
-import { Injectable, NgZone, OnDestroy } from '@angular/core';
-import { BehaviorSubject } from 'rxjs';
+const toRad = (d: number) => (d * Math.PI) / 180;
+const toDeg = (r: number) => (r * 180) / Math.PI;
 
-export interface CompassState {
-  targetBearing: number | null;
-  heading: number | null;
-  rotation: number | null;
-  error: string | null;
+export function bearingTo(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lng2 - lng1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+export function distanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000;
+  const dφ = toRad(lat2 - lat1), dλ = toRad(lng2 - lng1);
+  const a = Math.sin(dφ / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dλ / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
 }
 
 @Injectable({ providedIn: 'root' })
-export class CompassService implements OnDestroy {
-  // Approximate Cairo Tower coordinates.
-  private readonly target = {
-    latitude: 30.0459,
-    longitude: 31.2243,
-  };
+export class CompassService {
+  readonly position = signal<{ lat: number; lng: number } | null>(null);
+  readonly heading = signal<number | null>(null); // degrees clockwise from true/magnetic north
+  readonly error = signal<string | null>(null);
 
-  private watchId: number | null = null;
-  private listening = false;
-
-  private readonly stateSubject = new BehaviorSubject<CompassState>({
-    targetBearing: null,
-    heading: null,
-    rotation: null,
-    error: null,
+  readonly bearing = computed(() => {
+    const p = this.position();
+    return p ? bearingTo(p.lat, p.lng, CAIRO_TOWER.lat, CAIRO_TOWER.lng) : null;
   });
 
-  readonly state$ = this.stateSubject.asObservable();
+  readonly distance = computed(() => {
+    const p = this.position();
+    return p ? distanceMeters(p.lat, p.lng, CAIRO_TOWER.lat, CAIRO_TOWER.lng) : null;
+  });
 
-  constructor(private zone: NgZone) {}
+  private smoothed: number | null = null;
 
-  async start(): Promise<void> {
-    if (this.listening) return;
-
-    if (!('geolocation' in navigator)) {
-      this.update({ error: 'Geolocation is not supported.' });
-      return;
-    }
-
+  /** Must be called from a user gesture (iOS requires it for sensor permission). */
+  async start() {
     try {
-      await this.requestOrientationPermission();
-      this.listening = true;
-
-      window.addEventListener(
-        'deviceorientationabsolute',
-        this.handleOrientation as EventListener
-      );
-
-      // Fallback for browsers that do not emit the absolute event.
-      window.addEventListener(
-        'deviceorientation',
-        this.handleOrientation as EventListener
-      );
-
-      this.watchId = navigator.geolocation.watchPosition(
-        ({ coords }) => {
-          const targetBearing = this.calculateBearing(
-            coords.latitude,
-            coords.longitude,
-            this.target.latitude,
-            this.target.longitude
-          );
-
-          this.zone.run(() => {
-            this.update({ targetBearing });
-            this.recalculateRotation();
-          });
-        },
-        () => {
-          this.update({
-            error: 'Unable to access your location. Check permissions.',
-          });
-        },
-        {
-          enableHighAccuracy: true,
-          maximumAge: 1000,
-          timeout: 15000,
-        }
-      );
-    } catch {
-      this.update({
-        error: 'Compass access was denied or is unavailable.',
-      });
-    }
-  }
-
-  private async requestOrientationPermission(): Promise<void> {
-    const OrientationEvent = DeviceOrientationEvent as typeof DeviceOrientationEvent & {
-      requestPermission?: () => Promise<'granted' | 'denied'>;
-    };
-
-    if (typeof OrientationEvent.requestPermission === 'function') {
-      const permission = await OrientationEvent.requestPermission();
-
-      if (permission !== 'granted') {
-        throw new Error('Orientation permission denied');
+      const DOE = (window as any).DeviceOrientationEvent;
+      if (DOE && typeof DOE.requestPermission === 'function') {
+        const res = await DOE.requestPermission();
+        if (res !== 'granted') throw new Error('Motion permission denied');
       }
+
+      // Android: absolute event gives heading relative to north. iOS: webkitCompassHeading.
+      const evt = 'ondeviceorientationabsolute' in window
+        ? 'deviceorientationabsolute'
+        : 'deviceorientation';
+      window.addEventListener(evt as any, this.onOrientation, true);
+
+      navigator.geolocation.watchPosition(
+        p => this.position.set({ lat: p.coords.latitude, lng: p.coords.longitude }),
+        e => this.error.set(e.message),
+        { enableHighAccuracy: true, maximumAge: 1000 }
+      );
+    } catch (e: any) {
+      this.error.set(e.message ?? 'Failed to start compass');
     }
   }
 
-  private handleOrientation = (event: DeviceOrientationEvent): void => {
-    // This is a provisional heading calculation, not a universal
-    // compass-heading implementation for all device orientations.
-    if (event.alpha == null) return;
-
-    const heading = ((360 - event.alpha) % 360 + 360) % 360;
-
-    this.zone.run(() => {
-      this.update({ heading });
-      this.recalculateRotation();
-    });
+  private onOrientation = (e: any) => {
+    let h: number | null = null;
+    if (typeof e.webkitCompassHeading === 'number') h = e.webkitCompassHeading; // iOS
+    else if (e.alpha != null) h = (360 - e.alpha) % 360;                         // Android
+    if (h == null) return;
+    this.heading.set(this.smooth(h));
   };
 
-  private calculateBearing(
-    lat1: number,
-    lon1: number,
-    lat2: number,
-    lon2: number
-  ): number {
-    const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
-    const toDegrees = (radians: number) => (radians * 180) / Math.PI;
-
-    const phi1 = toRadians(lat1);
-    const phi2 = toRadians(lat2);
-    const deltaLambda = toRadians(lon2 - lon1);
-
-    const y = Math.sin(deltaLambda) * Math.cos(phi2);
-    const x =
-      Math.cos(phi1) * Math.sin(phi2) -
-      Math.sin(phi1) * Math.cos(phi2) * Math.cos(deltaLambda);
-
-    return (toDegrees(Math.atan2(y, x)) + 360) % 360;
-  }
-
-  private recalculateRotation(): void {
-    const { targetBearing, heading } = this.stateSubject.value;
-
-    if (targetBearing == null || heading == null) return;
-
-    const rotation = ((targetBearing - heading) % 360 + 360) % 360;
-    this.update({ rotation });
-  }
-
-  private update(patch: Partial<CompassState>): void {
-    this.stateSubject.next({
-      ...this.stateSubject.value,
-      ...patch,
-    });
-  }
-
-  stop(): void {
-    if (this.watchId !== null) {
-      navigator.geolocation.clearWatch(this.watchId);
-      this.watchId = null;
-    }
-
-    window.removeEventListener(
-      'deviceorientationabsolute',
-      this.handleOrientation as EventListener
-    );
-    window.removeEventListener(
-      'deviceorientation',
-      this.handleOrientation as EventListener
-    );
-
-    this.listening = false;
-  }
-
-  ngOnDestroy(): void {
-    this.stop();
+  // Circular low-pass filter to remove jitter
+  private smooth(h: number): number {
+    if (this.smoothed == null) return (this.smoothed = h);
+    const delta = ((h - this.smoothed + 540) % 360) - 180;
+    this.smoothed = (this.smoothed + delta * 0.2 + 360) % 360;
+    return this.smoothed;
   }
 }

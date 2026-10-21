@@ -1,141 +1,51 @@
-// import { Component } from '@angular/core';
-
-// @Component({
-//   selector: 'app-compass',
-//   imports: [],
-//   templateUrl: './compass.html',
-//   styleUrl: './compass.scss',
-// })
-
-import { CommonModule } from '@angular/common';
-import { Component, OnDestroy, OnInit } from '@angular/core';
-import { Subscription } from 'rxjs';
-import { CompassService, CompassState } from './compass-service';
+import { Component, effect, inject, signal } from '@angular/core';
+import { DecimalPipe } from '@angular/common';
+import { CompassService } from './compass-service';
 
 @Component({
   selector: 'app-compass',
   standalone: true,
-  imports: [CommonModule],
+  imports: [DecimalPipe],
   template: `
-    <main class="compass">
-      <h2>Find Cairo Tower</h2>
+    <button (click)="compass.start()">Start compass</button>
 
-      <div
-        class="compass-dial"
-        role="img"
-        aria-label="Direction indicator toward Cairo Tower"
-      >
-        <span class="north">N</span>
+    @if (compass.error(); as err) { <p class="err">{{ err }}</p> }
 
-        <div
-          class="arrow"
-          [style.transform]="'rotate(' + (state.rotation ?? 0) + 'deg)'"
-        >
-          ▲
-        </div>
-
-        <div class="center-dot"></div>
+    <div class="dial">
+      <div class="needle" [style.transform]="'rotate(' + rotation() + 'deg)'">
+        <div class="tip"></div>
       </div>
+      <span class="label">Cairo Tower</span>
+    </div>
 
-      <p *ngIf="state.rotation !== null">
-        Turn toward the arrow to reach Cairo Tower.
-      </p>
-
-      <p *ngIf="state.rotation === null">
-        Waiting for GPS and compass sensors…
-      </p>
-
-      <p *ngIf="state.error" class="error">
-        {{ state.error }}
-      </p>
-
-      <p *ngIf="state.targetBearing !== null">
-        Target bearing: {{ state.targetBearing | number:'1.0-0' }}°
-      </p>
-
-      <button type="button" (click)="start()">
-        Start compass
-      </button>
-
-      <button type="button" (click)="stop()">
-        Stop compass
-      </button>
-    </main>
+    @if (compass.distance(); as d) {
+      <p>{{ d / 1000 | number: '1.2-2' }} km</p>
+    }
   `,
   styles: [`
-    .compass {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 16px;
-      padding: 24px;
-      font-family: sans-serif;
-    }
-
-    .compass-dial {
-      position: relative;
-      display: grid;
-      place-items: center;
-      width: 240px;
-      height: 240px;
-      border: 2px solid #d5d5d5;
-      border-radius: 50%;
-    }
-
-    .north {
-      position: absolute;
-      top: 12px;
-      font-weight: 700;
-    }
-
-    .arrow {
-      color: #e60000;
-      font-size: 72px;
-      transform-origin: center;
-      transition: transform 100ms linear;
-    }
-
-    .center-dot {
-      position: absolute;
-      width: 10px;
-      height: 10px;
-      background: #222;
-      border-radius: 50%;
-    }
-
-    .error {
-      color: #c00;
-    }
-  `],
+    .dial { position: relative; width: 260px; height: 260px; margin: 24px auto;
+            border: 3px solid #444; border-radius: 50%; }
+    .needle { position: absolute; inset: 0; transition: transform 0.15s linear; }
+    .tip { position: absolute; left: 50%; top: 8px; width: 0; height: 0;
+           margin-left: -12px; border-left: 12px solid transparent;
+           border-right: 12px solid transparent; border-bottom: 110px solid #e60000; }
+    .label { position: absolute; bottom: -28px; width: 100%; text-align: center; }
+  `]
 })
-export class CompassComponent implements OnInit, OnDestroy {
-  state: CompassState = {
-    targetBearing: null,
-    heading: null,
-    rotation: null,
-    error: null,
-  };
+export class CompassComponent {
+  compass = inject(CompassService);
+  rotation = signal(0);
 
-  private subscription?: Subscription;
-
-  constructor(private compass: CompassService) {}
-
-  ngOnInit(): void {
-    this.subscription = this.compass.state$.subscribe(
-      state => (this.state = state)
-    );
-  }
-
-  start(): void {
-    void this.compass.start();
-  }
-
-  stop(): void {
-    this.compass.stop();
-  }
-
-  ngOnDestroy(): void {
-    this.subscription?.unsubscribe();
-    this.compass.stop();
+  constructor() {
+    // Unwrap the angle so the needle never spins 360° when crossing 0/360
+    effect(() => {
+      const b = this.compass.bearing();
+      const h = this.compass.heading();
+      if (b == null || h == null) return;
+      const target = (b - h + 360) % 360;
+      const current = this.rotation();
+      const delta = ((target - (current % 360) + 540) % 360) - 180;
+      this.rotation.set(current + delta);
+    }, { allowSignalWrites: true });
   }
 }
