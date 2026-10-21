@@ -1,4 +1,5 @@
-import { Injectable, signal, computed } from '@angular/core';
+// import { Injectable, signal, computed } from '@angular/core';
+import { Injectable, signal, computed, effect, untracked } from '@angular/core';
 
 export const CAIRO_TOWER = { lat: 30.0459, lng: 31.2243 };
 
@@ -40,6 +41,9 @@ export class CompassService {
 
   /** Must be called from a user gesture (iOS requires it for sensor permission). */
   async start() {
+     if (this.started) return;
+  this.started = true;
+  this.needsPermission.set(false);
     try {
       const DOE = (window as any).DeviceOrientationEvent;
       if (DOE && typeof DOE.requestPermission === 'function') {
@@ -78,4 +82,43 @@ export class CompassService {
     this.smoothed = (this.smoothed + delta * 0.2 + 360) % 360;
     return this.smoothed;
   }
+
+
+  // inside the class:
+readonly aligned = signal(false);
+readonly needsPermission = signal(false);
+private started = false;
+
+/** Signed angle to the target: 0 = straight ahead, negative = left, positive = right */
+readonly offset = computed(() => {
+  const b = this.bearing(), h = this.heading();
+  if (b == null || h == null) return null;
+  return ((b - h + 540) % 360) - 180;
+});
+
+constructor() {
+  // Hysteresis: lock at ±5°, release at ±10° so it doesn't flicker at the edge
+  effect(() => {
+    const o = this.offset();
+    if (o == null) return;
+    const abs = Math.abs(o);
+    const was = untracked(this.aligned);
+    if (!was && abs <= 5) {
+      this.aligned.set(true);
+      navigator.vibrate?.(200);
+    } else if (was && abs > 10) {
+      this.aligned.set(false);
+    }
+  });
+}
+
+/** Call on load. Starts immediately unless the platform needs a user tap. */
+init() {
+  const DOE = (window as any).DeviceOrientationEvent;
+  if (DOE && typeof DOE.requestPermission === 'function') {
+    this.needsPermission.set(true); // iOS: show the button
+  } else {
+    this.start();
+  }
+}
 }
